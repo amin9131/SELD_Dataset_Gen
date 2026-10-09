@@ -1,0 +1,148 @@
+# example_config.yaml
+# ---------------------------------------------------------------------------
+# Example configuration: paper-style dual tetrahedral array (two 4-mic
+# sub-arrays, 2 m from the origin). Everything is customizable -- swap the
+# "array" block, or the motion patterns below, for your own setup.
+# ---------------------------------------------------------------------------
+ 
+fs: 48000
+n_episodes: 10                 # number of independent continuous flights to simulate
+output_dir: "./output"
+master_seed: 42
+apply_air_absorption: true
+moving_block_size: 2048        # OLA block size (samples) for moving-source propagation
+metadata_dt_s: 0.05            # ground-truth trajectory/TDOA label rate (20 Hz)
+event_fade_s: 0.05             # short onset/offset fade (seconds) so entries/exits don't click
+n_workers: 1                   # 1 = sequential (single process, easiest to debug);
+                                # 0 = use ALL available CPU cores; N = use exactly N worker
+                                # processes. Episodes render independently in parallel, and
+                                # the generated dataset is byte-identical no matter what you
+                                # pick here (only wall-clock time changes) -- see
+                                # --n_workers on the CLI to override without editing this file.
+ 
+# ---------------------------------------------------------------------------
+# Automatic, leakage-free train/val/test splitting (disabled by default).
+# When enabled, every audio file in assets/{drone,wind,ambient_unknown,
+# known_unwanted} is assigned to exactly ONE split, stratified per source
+# class, before any episode is generated -- so no single recording is ever
+# reused across train/val/test. `n_episodes` above is then IGNORED in
+# favor of the per-split counts below, and output goes to
+# <output_dir>/<split_name>/... instead of directly into <output_dir>.
+# A split_manifest.json documenting exactly which files went where is
+# always written to <output_dir>.
+# ---------------------------------------------------------------------------
+split:
+  enabled: false
+  ratios:
+    train: 0.7
+    val: 0.15
+    test: 0.15
+  split_seed: 123                 # independent of master_seed, so changing episode-sampling
+                                   # parameters never accidentally reshuffles the file split
+  n_episodes:
+    train: 140
+    val: 30
+    test: 30
+ 
+array:
+  type: distributed_sub_arrays
+  sub_array_type: tetrahedral
+  sub_array_params:
+    radius_m: 1.0
+  centers:
+    - [2.0, 0.0, 0.0]
+    - [-2.0, 0.0, 0.0]
+  array_prefixes: ["arrA", "arrB"]
+ 
+ground_reflection:
+  enabled: false                    # off by default (matches the reference paper's setup)
+  ground_z: 0.0
+  model: delany_bazley              # "delany_bazley" (realistic, frequency+angle dependent)
+                                     # or "constant" (legacy: single real scalar, no
+                                     # frequency/angle dependence)
+  ground_type: grass                # used when model: delany_bazley (see
+                                     # ground_impedance.GROUND_TYPE_PRESETS for all options:
+                                     # snow_fresh, forest_floor, soil_soft, grass, sand,
+                                     # soil_compacted, gravel, asphalt, concrete, rigid)
+  flow_resistivity_kpa_sm2: null    # optional: explicit override (kPa*s/m^2) instead of
+                                     # a ground_type preset
+  reflection_coefficient: 0.3       # only used when model: constant
+ 
+assets:
+  drone_dir: "./assets/drone"
+  wind_dir: "./assets/wind"
+  ambient_unknown_dir: "./assets/ambient_unknown"
+  known_unwanted_dir: "./assets/known_unwanted"
+ 
+episode:
+  episode_duration_s_range: [15.0, 25.0]   # one continuous simulated flight
+  chunk_duration_s: 4.0                    # each flight is sliced into 4s training clips
+ 
+  # --- drones appear and disappear at random times during the episode ---
+  # (this is what gives variable, real-world-like polyphony: sometimes 0,
+  # sometimes several drones active at once, entering/leaving independently)
+  drone_events:
+    n_events_range: [1, 3]              # total appearances across the WHOLE episode
+    event_duration_s_range: [4.0, 12.0]  # how long each appearance stays audible
+    min_event_duration_s: 1.0
+ 
+  interferer_events:
+    n_events_range: [0, 3]
+    event_duration_s_range: [2.0, 8.0]
+    min_event_duration_s: 0.5
+ 
+  drone_position_range:
+    use_shell: true
+    radius_range: [5.0, 40.0]
+    azimuth_range_deg: [0.0, 360.0]
+    elevation_range_deg: [5.0, 70.0]
+ 
+  interferer_position_range:
+    use_shell: true
+    radius_range: [3.0, 30.0]
+    azimuth_range_deg: [0.0, 360.0]
+    elevation_range_deg: [0.0, 30.0]
+ 
+  # --- realistic drone flight-pattern mixture ---
+  drone_motion:
+    pattern_weights:
+      hover_jitter: 0.2        # loitering to observe/photograph a target
+      linear_flyby: 0.25       # straight-line approach/recede/overflight
+      waypoint_mission: 0.35   # multi-leg mission with realistic accel/cruise/decel legs
+      orbit: 0.2               # circling a point of interest (surveillance loiter)
+    v_max_range_mps: [3.0, 18.0]
+    a_max_range_mps2: [1.5, 4.0]
+    hover_jitter_std_range_m: [0.2, 1.2]
+    orbit_radius_range_m: [5.0, 30.0]
+    n_waypoints_range: [2, 4]
+    waypoint_hover_dwell_range_s: [0.0, 2.0]
+ 
+  # --- interferer motion: simpler mixture (e.g. a bird or car passing by) ---
+  interferer_motion:
+    pattern_weights:
+      hover_jitter: 0.5
+      linear_flyby: 0.5
+      waypoint_mission: 0.0
+      orbit: 0.0
+    v_max_range_mps: [1.0, 10.0]
+    a_max_range_mps2: [1.0, 3.0]
+    hover_jitter_std_range_m: [0.1, 0.8]
+    orbit_radius_range_m: [5.0, 20.0]
+    n_waypoints_range: [2, 2]
+    waypoint_hover_dwell_range_s: [0.0, 0.0]
+ 
+  wind_snr_db_range: [0.0, 20.0]
+  wind_mode_choices: ["diffuse", "directional"]
+  wind_coherent: true    # when mode="diffuse": synthesize a physically realistic,
+                          # spatially-coherent diffuse field (spherically isotropic
+                          # coherence law) instead of independent per-mic noise --
+                          # set false only for ablation/comparison against the
+                          # simpler, less realistic independent-noise model
+ 
+  ambient_snr_db_range: [5.0, 25.0]
+  ambient_mode_choices: ["diffuse", "directional"]
+  ambient_coherent: true
+ 
+  temperature_c_range: [0.0, 35.0]
+  relative_humidity_pct_range: [20.0, 90.0]
+  pressure_kpa_range: [98.0, 103.0]
