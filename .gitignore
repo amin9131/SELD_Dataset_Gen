@@ -1,2 +1,11 @@
 assets/
 wind dataset.txt
+.venv/
+assets/
+wind dataset.txt
+assets/
+wind dataset.txt
+assets/
+output/
+metadate.json
+__pycache__/

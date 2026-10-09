@@ -62,8 +62,8 @@ from scipy.signal import stft
  
 @dataclass
 class FeatureConfig:
-    n_fft: int = 1024
-    hop_length: int = 512          # noverlap = n_fft - hop_length
+    n_fft: int = 2048 # 1024, 2048
+    hop_length: int = 1024 # 512, 1024          # noverlap = n_fft - hop_length
     n_mels: int = 64
     fmin_hz: float = 20.0
     fmax_hz: Optional[float] = None   # None -> fs / 2

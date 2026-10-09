@@ -111,7 +111,7 @@ class ModelConfig:
     # peak sits IS the localization information.
     freq_pool: int = 4           # max-pool factor on the feature axis after each conv block
     logmel_freq_bins: int = 4    # bins kept per channel from the log-mel branch
-    gcc_freq_bins: int = 32      # bins kept per channel from the GCC-PHAT branch
+    gcc_freq_bins: int = 21 #32      # bins kept per channel from the GCC-PHAT branch
  
     # --- architecture knobs ---
     backbone: str = "crnn"        # "crnn" or "conformer" -- switchable, see module docstring

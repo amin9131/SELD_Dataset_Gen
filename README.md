@@ -249,3 +249,10 @@ Known limitations of this layer (documented in each file's own docstring, summar
 Log-mel and GCC-PHAT are computed on the physically MIXED multichannel signal -- they cannot be un-mixed into one clean feature per source when events overlap in time. PIT fixes the label/matching side of variable polyphony, not the underlying source-separation problem the model itself has to learn.
 label_alignment.py raises (rather than silently truncating) if a chunk has more simultaneously-active events than max_tracks -- set max_tracks with your config's n_events_range values in mind.
 SELDDataset does not cache computed features to disk; for very large datasets, I/O + on-the-fly STFT/mel/GCC-PHAT computation may become the training bottleneck (not addressed here).
+
+# 1) اعتبارسنجی فیزیک (static / moving / onset)
+python validate_gcc_phat.py --config my_config.yaml
+
+# 2) ساخت دیتاست
+python dataset_generator.py --config my_config.yaml --n_workers 0
+#   اختیاری: --n_episodes 200   یا   --split train
