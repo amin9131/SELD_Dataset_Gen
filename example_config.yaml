@@ -5,7 +5,7 @@
 # "array" block, or the motion patterns below, for your own setup.
 # ---------------------------------------------------------------------------
  
-fs: 48000
+fs: 24000
 n_episodes: 10                 # number of independent continuous flights to simulate
 output_dir: "./output"
 master_seed: 42
@@ -48,10 +48,10 @@ array:
   type: distributed_sub_arrays
   sub_array_type: tetrahedral
   sub_array_params:
-    radius_m: 1.0
+    radius_m: 0.04
   centers:
-    - [2.0, 0.0, 0.0]
-    - [-2.0, 0.0, 0.0]
+    - [1.0, 0.0, 0.0]
+    - [-1.0, 0.0, 0.0]
   array_prefixes: ["arrA", "arrB"]
  
 ground_reflection:
@@ -60,7 +60,7 @@ ground_reflection:
   model: delany_bazley              # "delany_bazley" (realistic, frequency+angle dependent)
                                      # or "constant" (legacy: single real scalar, no
                                      # frequency/angle dependence)
-  ground_type: grass                # used when model: delany_bazley (see
+  ground_type: sand                # used when model: delany_bazley (see
                                      # ground_impedance.GROUND_TYPE_PRESETS for all options:
                                      # snow_fresh, forest_floor, soil_soft, grass, sand,
                                      # soil_compacted, gravel, asphalt, concrete, rigid)
