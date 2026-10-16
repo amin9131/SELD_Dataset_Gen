@@ -9,3 +9,4 @@ assets/
 output/
 metadate.json
 __pycache__/
+runs/

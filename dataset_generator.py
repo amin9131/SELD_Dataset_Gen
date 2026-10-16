@@ -63,32 +63,9 @@ def build_event_cfg(d: dict) -> EventConfig:
  
  
 def build_array_from_config(array_cfg: dict) -> ag.MicPositions:
-    kind = array_cfg["type"]
- 
-    if kind == "custom_points":
-        return ag.custom_points(array_cfg["points"])
-    if kind == "linear":
-        return ag.linear_array(**array_cfg["params"])
-    if kind == "circular":
-        return ag.circular_array(**array_cfg["params"])
-    if kind == "tetrahedral":
-        return ag.tetrahedral_array(**array_cfg["params"])
-    if kind == "distributed_sub_arrays":
-        sub_type = array_cfg["sub_array_type"]
-        builder = {
-            "linear": ag.linear_array,
-            "circular": ag.circular_array,
-            "tetrahedral": ag.tetrahedral_array,
-        }[sub_type]
-        return ag.distributed_sub_arrays(
-            sub_array_builder=builder,
-            sub_array_kwargs=array_cfg["sub_array_params"],
-            centers=array_cfg["centers"],
-            array_prefixes=array_cfg.get("array_prefixes"),
-        )
-    raise ValueError(f"Unknown array type: {kind}")
- 
- 
+    return ag.from_config(array_cfg)
+
+
 def build_position_range(d: dict) -> PositionRange:
     return PositionRange(**d)
  
@@ -106,6 +83,11 @@ def build_mixer_cfg(cfg: dict, fs: int, class_map: dict) -> MixerConfig:
         moving_block_size=cfg.get("moving_block_size", 2048),
         metadata_dt_s=cfg.get("metadata_dt_s", 0.05),
         event_fade_s=cfg.get("event_fade_s", 0.05),
+        label_time_reference=cfg.get("label_time_reference", "reception"),
+        label_vad_db=cfg.get("label_vad_db", 30.0),
+        label_vad_frame_s=cfg.get("label_vad_frame_s", 0.02),
+        label_min_gap_s=cfg.get("label_min_gap_s", 0.10),
+        label_min_segment_s=cfg.get("label_min_segment_s", 0.10),
         class_map=class_map,
     )
  
@@ -241,6 +223,7 @@ def _render_and_write_episode(context: dict, episode_index: int, seed: int) -> d
  
         meta = chunk["metadata"]
         meta["mic_channel_order"] = mic_names
+        meta["mic_groups"] = ag.infer_mic_groups(mic_names)
         with open(os.path.join(chunk_dir, "metadata.json"), "w") as f:
             json.dump(meta, f, indent=2)
  

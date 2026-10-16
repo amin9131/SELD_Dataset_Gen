@@ -31,7 +31,7 @@ Signal categories and how each is spatialized:
 """
  
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 import random as pyrandom
  
 import numpy as np
@@ -60,6 +60,20 @@ class MixerConfig:
     moving_block_size: int = 2048
     metadata_dt_s: float = 0.05   # ground-truth trajectory/TDOA sampling rate (20 Hz default)
     event_fade_s: float = 0.05    # short onset/offset fade to avoid audible clicks at entry/exit
+    # --- DCASE-style label activity -----------------------------------
+    # A source carries a label ONLY while it is actually audible at the array.
+    #   label_time_reference "reception": labels live on the time axis of the
+    #     RECORDING. A source emitted at t is heard R/c later (up to ~120 ms at
+    #     40 m), and its label position is where it was when the heard sound
+    #     was emitted. "emission": legacy -- labels on the emission clock.
+    #   label_vad_db: energy threshold (dB below the clip RMS) of the VAD run
+    #     on the dry source clip (after fades). Frames below it are silence ->
+    #     no label. None disables the VAD (whole event window is active).
+    label_time_reference: str = "reception"
+    label_vad_db: Optional[float] = 30.0
+    label_vad_frame_s: float = 0.02
+    label_min_gap_s: float = 0.10       # silent gaps shorter than this are bridged
+    label_min_segment_s: float = 0.10   # active runs shorter than this are dropped
     class_map: Dict[str, int] = None  # {class_name: class_id}, built once for the whole dataset
                                         # (see dataset_generator.py) so ids stay consistent
                                         # across every episode/chunk
@@ -132,6 +146,7 @@ def _render_event(
     medium: MediumConditions,
     mixer_cfg: MixerConfig,
     py_rng: pyrandom.Random,
+    return_dry: bool = False,
 ):
     """Draws a clip sized to this event's own duration, fades it in/out,
     and propagates it along the event's trajectory. The trajectory lives in
@@ -151,9 +166,79 @@ def _render_event(
         ground_reflection=mixer_cfg.ground_reflection,
         block_size=mixer_cfg.moving_block_size,
     )
+    if return_dry:
+        return per_mic, clip.class_name, clip.source_path, sig
     return per_mic, clip.class_name, clip.source_path
  
  
+# ---------------------------------------------------------------------------
+# DCASE-style label activity: WHEN is a source audible, and at what position
+# ---------------------------------------------------------------------------
+
+def _active_segments(sig: np.ndarray, fs: int, cfg: MixerConfig) -> List[Tuple[float, float]]:
+    """
+    Energy VAD on the dry (faded, RMS-normalised) source clip. Returns the
+    audible stretches as [(start_s, end_s), ...] in EVENT-LOCAL emission time.
+    Gaps shorter than cfg.label_min_gap_s are bridged, runs shorter than
+    cfg.label_min_segment_s dropped. An empty list = nothing audible = no label.
+    DCASE analogue: the per-file on/offset annotations that keep silent parts
+    of a sound-event file from being labelled.
+    """
+    n = len(sig)
+    dur = n / float(fs)
+    if cfg.label_vad_db is None or n == 0:
+        return [(0.0, dur)] if n else []
+    fl = max(1, int(round(cfg.label_vad_frame_s * fs)))
+    nf = n // fl
+    if nf == 0:
+        return [(0.0, dur)]
+    r = np.sqrt((sig[: nf * fl].reshape(nf, fl) ** 2).mean(axis=1))
+    act = r > rms(sig) * 10.0 ** (-cfg.label_vad_db / 20.0)
+
+    runs, i = [], 0
+    while i < nf:
+        if act[i]:
+            j = i
+            while j + 1 < nf and act[j + 1]:
+                j += 1
+            runs.append([i * fl / fs, ((j + 1) * fl / fs) if j < nf - 1 else dur])
+            i = j + 1
+        else:
+            i += 1
+    merged: List[List[float]] = []
+    for a, b in runs:
+        if merged and a - merged[-1][1] < cfg.label_min_gap_s:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged if b - a >= cfg.label_min_segment_s]
+
+
+def _delay_to_ref_s(traj, t_local: float, ref: np.ndarray, v: float) -> float:
+    t = min(max(t_local, 0.0), traj.duration_s)
+    return float(np.linalg.norm(traj.position_at(t) - ref)) / v
+
+
+def _emission_time_for_reception(traj, tau_local: float, ref: np.ndarray, v: float, n_iter: int = 4) -> float:
+    """Emission time te solving te + |p(te) - ref| / v = tau_local (fixed-point
+    iteration; converges fast because source speed << speed of sound)."""
+    te = tau_local
+    for _ in range(n_iter):
+        te = tau_local - _delay_to_ref_s(traj, te, ref, v)
+    return te
+
+
+def _segments_to_episode_time(event: SourceEvent, segs_local, ref, v, time_reference: str):
+    """Event-local EMISSION segments -> absolute episode time on the label clock."""
+    out = []
+    for a, b in segs_local:
+        if time_reference == "reception":
+            a = a + _delay_to_ref_s(event.trajectory, a, ref, v)
+            b = b + _delay_to_ref_s(event.trajectory, b, ref, v)
+        out.append((event.start_s + a, event.start_s + b))
+    return out
+
+
 def render_episode(
     episode: Episode,
     mic_positions: MicPositions,
@@ -180,27 +265,32 @@ def render_episode(
     mixed_full = _zeros_per_mic(mic_positions, total_n)
     drone_reference_full = np.zeros(total_n)
  
-    drone_render = []       # per drone event: {"class_name", "source_file"}
+    drone_render = []       # per event: {"class_name", "source_file", "segments_abs"}
     interferer_render = []
+    ref_pos = mic_mat.mean(axis=0)   # labels are referenced to the array centroid
  
     # --- drones: each event only exists during its own [start_s, end_s) window ---
     for event in episode.drones:
-        per_mic, class_name, source_path = _render_event(
-            event, pools.drone, fs, mic_positions, medium, mixer_cfg, py_rng
+        per_mic, class_name, source_path, dry = _render_event(
+            event, pools.drone, fs, mic_positions, medium, mixer_cfg, py_rng, return_dry=True
         )
         start_sample = int(round(event.start_s * fs))
         _add_at_offset(mixed_full, per_mic, start_sample)
         _add_1d_at_offset(drone_reference_full, per_mic[mic_names[0]], start_sample)
-        drone_render.append({"class_name": class_name, "source_file": source_path})
+        segs = _segments_to_episode_time(event, _active_segments(dry, fs, mixer_cfg), ref_pos,
+                                         medium.v_sound, mixer_cfg.label_time_reference)
+        drone_render.append({"class_name": class_name, "source_file": source_path, "segments_abs": segs})
  
     # --- known-but-unwanted interferers: same event-window treatment ---
     for event in episode.interferers:
-        per_mic, class_name, source_path = _render_event(
-            event, pools.known_unwanted, fs, mic_positions, medium, mixer_cfg, py_rng
+        per_mic, class_name, source_path, dry = _render_event(
+            event, pools.known_unwanted, fs, mic_positions, medium, mixer_cfg, py_rng, return_dry=True
         )
         start_sample = int(round(event.start_s * fs))
         _add_at_offset(mixed_full, per_mic, start_sample)
-        interferer_render.append({"class_name": class_name, "source_file": source_path})
+        segs = _segments_to_episode_time(event, _active_segments(dry, fs, mixer_cfg), ref_pos,
+                                         medium.v_sound, mixer_cfg.label_time_reference)
+        interferer_render.append({"class_name": class_name, "source_file": source_path, "segments_abs": segs})
  
     # --- reference loudness for noise SNR scaling: RMS over only the
     #     samples where at least one drone event is actually active, so
@@ -264,12 +354,12 @@ def render_episode(
         drones_meta = _events_active_in_chunk(
             episode.drones, drone_render, t0, t1, dt_meta, class_map,
             category="drone", mic_names=mic_names, mic_mat=mic_mat, medium=medium,
-            include_tdoa=True,
+            include_tdoa=True, ref_pos=ref_pos, time_reference=mixer_cfg.label_time_reference,
         )
         interferers_meta = _events_active_in_chunk(
             episode.interferers, interferer_render, t0, t1, dt_meta, class_map,
             category="known_unwanted", mic_names=mic_names, mic_mat=mic_mat, medium=medium,
-            include_tdoa=True,
+            include_tdoa=True, ref_pos=ref_pos, time_reference=mixer_cfg.label_time_reference,
         )
  
         metadata = {
@@ -292,6 +382,8 @@ def render_episode(
             "n_active_known_unwanted": len(interferers_meta),
             "wind": {"mode": episode.wind_cfg.mode, "snr_db": episode.wind_cfg.snr_db},
             "ambient_unknown": {"mode": episode.ambient_cfg.mode, "snr_db": episode.ambient_cfg.snr_db},
+            "label_time_reference": mixer_cfg.label_time_reference,
+            "label_vad_db": mixer_cfg.label_vad_db,
             "seed": episode.seed,
             "episode_gain": episode_gain,
         }
@@ -313,37 +405,62 @@ def _events_active_in_chunk(
     mic_mat: np.ndarray,
     medium: MediumConditions,
     include_tdoa: bool,
+    ref_pos: np.ndarray = None,
+    time_reference: str = "reception",
 ) -> List[Dict]:
-    """Builds the metadata list for only the events that actually overlap
-    [t0, t1) -- this is what makes the number of "active" sources per
-    chunk vary naturally with each event's onset/offset."""
+    """
+    Metadata list for ONLY the events that are actually AUDIBLE inside
+    [t0, t1): an event whose audible segments (VAD, see _active_segments)
+    do not overlap this chunk is not listed at all -- so in silence there is
+    no label, and a source that appears/disappears is labelled exactly over
+    the span it is heard. Times are on the label clock (see
+    MixerConfig.label_time_reference); `trajectory_samples[*]["t"]` is that
+    clock and `position_xyz_m` is the position of the source when the sound
+    heard at that time was emitted (reception mode), so position, TDOA and
+    audio always describe the same wavefront. Every sample has an "active"
+    flag; `active_segments_s` lists the audible spans (unclipped).
+    """
+    ref_pos = mic_mat.mean(axis=0) if ref_pos is None else ref_pos
     out = []
     for event, info in zip(events, render_info):
-        ov0, ov1 = max(t0, event.start_s), min(t1, event.end_s)
-        if ov0 >= ov1:
-            continue  # this event does not overlap this chunk at all
- 
-        local0, local1 = ov0 - event.start_s, ov1 - event.start_s
-        samples = event.trajectory.sample(local0, local1, dt_meta)
- 
+        segs = info["segments_abs"]
+        if not any(min(t1, b) > max(t0, a) for a, b in segs):
+            continue  # nothing of this event is audible in this chunk
+
+        onset_s, offset_s = segs[0][0], segs[-1][1]
+        ov0, ov1 = max(t0, onset_s), min(t1, offset_s)
         class_name = info["class_name"]
         class_id = class_map.get(class_name, -1)
-        for samp in samples:
-            samp["t"] = samp["t"] + event.start_s  # back to absolute episode time
-            samp["class_name"] = class_name
-            samp["class_id"] = class_id
+
+        samples = []
+        for tau in np.arange(ov0, ov1, dt_meta):
+            tau_local = float(tau) - event.start_s
+            te = (_emission_time_for_reception(event.trajectory, tau_local, ref_pos, medium.v_sound)
+                  if time_reference == "reception" else tau_local)
+            te = min(max(te, 0.0), event.trajectory.duration_s)
+            pos = event.trajectory.position_at(te)
+            samp = {
+                "t": float(tau),
+                "position_xyz_m": pos.tolist(),
+                "active": any(a <= tau <= b for a, b in segs),
+                "class_name": class_name,
+                "class_id": class_id,
+            }
             if include_tdoa:
-                samp["tdoa_s"] = _per_pair_tdoa(np.array(samp["position_xyz_m"]), mic_names, mic_mat, medium)
- 
+                samp["tdoa_s"] = _per_pair_tdoa(pos, mic_names, mic_mat, medium)
+            samples.append(samp)
+
         out.append({
             "category": category,
             "class_name": class_name,
             "class_id": class_id,
             "source_file": info["source_file"],
-            "onset_s": event.start_s,
-            "offset_s": event.end_s,
+            "onset_s": onset_s,               # first audible instant (label clock)
+            "offset_s": offset_s,             # last audible instant (label clock)
+            "active_segments_s": [[a, b] for a, b in segs],
+            "emission_onset_s": event.start_s,
+            "emission_offset_s": event.end_s,
             "trajectory_samples": samples,
         })
- 
+
     return out
- 

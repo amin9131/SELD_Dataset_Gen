@@ -41,7 +41,7 @@ import glob
 import json
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
  
 import numpy as np
  
@@ -95,13 +95,27 @@ class _WelfordAccumulator:
         return self.mean, std
  
  
+# GCC-PHAT feature keys: legacy single tensor, or the grouped INTRA/INTER pair
+# (feature_extraction.FeatureConfig.pair_mode = "grouped"). Each key gets its own
+# per-(pair, lag) statistics.
+GCC_KEYS = ("gcc_phat", "gcc_phat_intra", "gcc_phat_inter")
+
+
 @dataclass
 class FeatureNormalizer:
     logmel_mean: Optional[np.ndarray] = None    # (n_mics, n_mels)
     logmel_std: Optional[np.ndarray] = None
-    gcc_mean: Optional[np.ndarray] = None        # (n_pairs, n_lags)
+    gcc_mean: Optional[np.ndarray] = None        # legacy "gcc_phat": (n_pairs, n_lags)
     gcc_std: Optional[np.ndarray] = None
+    gcc_intra_mean: Optional[np.ndarray] = None  # "gcc_phat_intra"
+    gcc_intra_std: Optional[np.ndarray] = None
+    gcc_inter_mean: Optional[np.ndarray] = None  # "gcc_phat_inter"
+    gcc_inter_std: Optional[np.ndarray] = None
     n_chunks_fitted: int = 0
+
+    _ATTR = {"gcc_phat": ("gcc_mean", "gcc_std"),
+             "gcc_phat_intra": ("gcc_intra_mean", "gcc_intra_std"),
+             "gcc_phat_inter": ("gcc_inter_mean", "gcc_inter_std")}
  
     def fit(
         self,
@@ -116,26 +130,34 @@ class FeatureNormalizer:
             chunk_dirs = chunk_dirs[:max_chunks]
  
         logmel_acc = None
-        gcc_acc = None
- 
+        gcc_acc: Dict[str, _WelfordAccumulator] = {}
+
         for chunk_dir in chunk_dirs:
             feats = extract_features_from_chunk(chunk_dir, feat_cfg)
             logmel = feats["logmel"]   # (n_mics, n_frames, n_mels)
-            gcc = feats["gcc_phat"]    # (n_pairs, n_frames, n_lags)
- 
+
             if logmel_acc is None:
                 logmel_acc = _WelfordAccumulator((logmel.shape[0], logmel.shape[2]))
-                gcc_acc = _WelfordAccumulator((gcc.shape[0], gcc.shape[2]))
- 
             # move the time-frame axis to the front: (n_frames, n_mics, n_mels)
             logmel_acc.update_batch(np.moveaxis(logmel, 1, 0))
-            gcc_acc.update_batch(np.moveaxis(gcc, 1, 0))
- 
+
+            for key in GCC_KEYS:
+                if key not in feats:
+                    continue
+                gcc = feats[key]       # (n_pairs_scope, n_frames, n_lags_scope)
+                if key not in gcc_acc:
+                    gcc_acc[key] = _WelfordAccumulator((gcc.shape[0], gcc.shape[2]))
+                gcc_acc[key].update_batch(np.moveaxis(gcc, 1, 0))
+
         self.logmel_mean, self.logmel_std = logmel_acc.finalize()
-        self.gcc_mean, self.gcc_std = gcc_acc.finalize()
+        for key, acc in gcc_acc.items():
+            m_attr, s_attr = self._ATTR[key]
+            m, sd = acc.finalize()
+            setattr(self, m_attr, m)
+            setattr(self, s_attr, sd)
         self.n_chunks_fitted = len(chunk_dirs)
         return self
- 
+
     def transform_logmel(self, logmel: np.ndarray) -> np.ndarray:
         """logmel: (n_mics, n_frames, n_mels) -> same shape, z-scored."""
         self._check_fitted()
@@ -143,50 +165,60 @@ class FeatureNormalizer:
         std = self.logmel_std[:, None, :]
         return (logmel - mean) / std
  
-    def transform_gcc(self, gcc: np.ndarray) -> np.ndarray:
-        """gcc_phat: (n_pairs, n_frames, n_lags) -> same shape, z-scored."""
+    def transform_gcc(self, gcc: np.ndarray, key: str = "gcc_phat") -> np.ndarray:
+        """gcc: (n_pairs, n_frames, n_lags) -> same shape, z-scored with the
+        statistics fitted for `key` ("gcc_phat" | "gcc_phat_intra" | "gcc_phat_inter")."""
         self._check_fitted()
-        mean = self.gcc_mean[:, None, :]
-        std = self.gcc_std[:, None, :]
-        return (gcc - mean) / std
- 
+        m_attr, s_attr = self._ATTR[key]
+        mean, std = getattr(self, m_attr), getattr(self, s_attr)
+        if mean is None:
+            raise RuntimeError(f"FeatureNormalizer has no statistics for '{key}' "
+                               f"(it was fitted on a dataset/FeatureConfig without that feature).")
+        return (gcc - mean[:, None, :]) / std[:, None, :]
+
     def apply(self, feats: dict) -> dict:
-        """Returns a shallow copy of `feats` with 'logmel'/'gcc_phat'
-        replaced by their normalized versions; all other keys untouched."""
+        """Returns a shallow copy of `feats` with 'logmel' and every present GCC
+        key replaced by its normalized version; all other keys untouched."""
         out = dict(feats)
         out["logmel"] = self.transform_logmel(feats["logmel"])
-        out["gcc_phat"] = self.transform_gcc(feats["gcc_phat"])
+        for key in GCC_KEYS:
+            if key in feats:
+                out[key] = self.transform_gcc(feats[key], key)
         return out
- 
+
     def _check_fitted(self) -> None:
-        if self.logmel_mean is None or self.gcc_mean is None:
+        if self.logmel_mean is None or not any(
+                getattr(self, self._ATTR[k][0]) is not None for k in GCC_KEYS):
             raise RuntimeError("FeatureNormalizer has not been fit()/load()ed yet.")
- 
+
     def save(self, path: str) -> None:
         self._check_fitted()
-        payload = {
-            "logmel_mean": self.logmel_mean.tolist(),
-            "logmel_std": self.logmel_std.tolist(),
-            "gcc_mean": self.gcc_mean.tolist(),
-            "gcc_std": self.gcc_std.tolist(),
-            "n_chunks_fitted": self.n_chunks_fitted,
-        }
+        payload = {"logmel_mean": self.logmel_mean.tolist(),
+                   "logmel_std": self.logmel_std.tolist(),
+                   "n_chunks_fitted": self.n_chunks_fitted}
+        for key in GCC_KEYS:
+            m_attr, s_attr = self._ATTR[key]
+            if getattr(self, m_attr) is not None:
+                payload[m_attr] = getattr(self, m_attr).tolist()
+                payload[s_attr] = getattr(self, s_attr).tolist()
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
- 
+
     @classmethod
     def load(cls, path: str) -> "FeatureNormalizer":
         with open(path, "r") as f:
             payload = json.load(f)
-        return cls(
-            logmel_mean=np.array(payload["logmel_mean"]),
-            logmel_std=np.array(payload["logmel_std"]),
-            gcc_mean=np.array(payload["gcc_mean"]),
-            gcc_std=np.array(payload["gcc_std"]),
-            n_chunks_fitted=payload.get("n_chunks_fitted", 0),
-        )
- 
- 
+        obj = cls(logmel_mean=np.array(payload["logmel_mean"]),
+                  logmel_std=np.array(payload["logmel_std"]),
+                  n_chunks_fitted=payload.get("n_chunks_fitted", 0))
+        for key in GCC_KEYS:          # old files only contain gcc_mean / gcc_std
+            m_attr, s_attr = cls._ATTR[key]
+            if m_attr in payload:
+                setattr(obj, m_attr, np.array(payload[m_attr]))
+                setattr(obj, s_attr, np.array(payload[s_attr]))
+        return obj
+
+
 if __name__ == "__main__":
     import argparse
  
@@ -201,5 +233,9 @@ if __name__ == "__main__":
     norm = FeatureNormalizer().fit(args.dataset_dir, max_chunks=args.max_chunks)
     norm.save(args.out)
     print(f"Fitted on {norm.n_chunks_fitted} chunks under '{args.dataset_dir}'.")
-    print(f"logmel_mean shape={norm.logmel_mean.shape}, gcc_mean shape={norm.gcc_mean.shape}")
+    print(f"logmel_mean shape={norm.logmel_mean.shape}")
+    for k in GCC_KEYS:
+        a = getattr(norm, FeatureNormalizer._ATTR[k][0])
+        if a is not None:
+            print(f"{k} mean shape={a.shape}")
     print(f"Saved stats to '{args.out}'")

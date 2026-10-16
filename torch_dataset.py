@@ -28,7 +28,9 @@ Usage
  
     for batch in loader:
         batch["logmel"]              # (B, n_mics, n_frames, n_mels)
-        batch["gcc_phat"]            # (B, n_pairs, n_frames, n_lags)
+        batch["gcc_phat"]            # (B, n_pairs, n_frames, n_lags)   [pair_mode="all"]
+        batch["gcc_phat_intra"]      # (B, n_intra, n_frames, n_lags_i) [pair_mode="grouped"]
+        batch["gcc_phat_inter"]      # (B, n_inter, n_frames, n_lags_o) [pair_mode="grouped"]
         batch["drone_position"]      # (B, n_frames, max_tracks, 3)
         batch["drone_tdoa"]          # (B, n_frames, max_tracks, n_pairs)
         batch["drone_class_id"]      # (B, n_frames, max_tracks)
@@ -97,16 +99,21 @@ class SELDDataset(Dataset):
         feats, labels = example["features"], example["labels"]
  
         logmel = feats["logmel"]
-        gcc_phat = feats["gcc_phat"]
         if self.normalizer is not None:
             logmel = self.normalizer.transform_logmel(logmel)
-            gcc_phat = self.normalizer.transform_gcc(gcc_phat)
- 
+
         item = {
             "logmel": torch.from_numpy(logmel).float(),      # (n_mics, n_frames, n_mels)
-            "gcc_phat": torch.from_numpy(gcc_phat).float(),  # (n_pairs, n_frames, n_lags)
             "chunk_dir": chunk_dir,
         }
+        # "gcc_phat" (legacy, pair_mode="all") or "gcc_phat_intra"/"gcc_phat_inter"
+        # (pair_mode="grouped"): whichever feature_extraction produced.
+        for key in ("gcc_phat", "gcc_phat_intra", "gcc_phat_inter"):
+            if key in feats:
+                arr = feats[key]                              # (n_pairs_*, n_frames, n_lags_*)
+                if self.normalizer is not None:
+                    arr = self.normalizer.transform_gcc(arr, key)
+                item[key] = torch.from_numpy(arr).float()
         for category, lab in labels.items():
             item[f"{category}_position"] = torch.from_numpy(lab["position_xyz_m"]).float()
             item[f"{category}_tdoa"] = torch.from_numpy(lab["tdoa_s"]).float()

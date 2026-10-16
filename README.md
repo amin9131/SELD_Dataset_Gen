@@ -256,3 +256,36 @@ python validate_gcc_phat.py --config my_config.yaml
 # 2) ساخت دیتاست
 python dataset_generator.py --config my_config.yaml --n_workers 0
 #   اختیاری: --n_episodes 200   یا   --split train
+
+## Update: two-array geometry, grouped GCC-PHAT, DCASE-style label activity
+
+**Arrays.** Run `python array_analysis.py --config example_config.yaml` before generating: it reports, per pair
+group (INTRA = inside one sub-array, INTER = across sub-arrays), the tonal-ambiguity frequency c/(2d), the lag
+window, the bearing error per sample of TDOA error, and the range error vs. baseline B. Keep sub-arrays compact
+(example: r = 5 cm) and the baseline long (example: B = 4 m): compact arrays give an unambiguous coarse DOA, the
+long baseline gives precise but ambiguous TDOA/parallax. Do not treat the two arrays as one big array.
+
+**Features / model.** `FeatureConfig(pair_mode="grouped")` produces `gcc_phat_intra` (own small lag window,
+sub-sample interpolation) and `gcc_phat_inter` (own long lag window). `SELDDataset`, `FeatureNormalizer`
+(per-key statistics), `label_alignment` (TDOA pair axis = intra pairs then inter pairs) and `model.py`
+(`ModelConfig(**infer_dims_from_batch(batch))`, `model.forward_batch(batch)`) all follow. The default
+`pair_mode="all"` keeps the old single `gcc_phat` tensor.
+
+**Labels (DCASE-style).** A source is labelled ONLY while it is audible: (1) an energy VAD on the dry clip
+(`label_vad_db`) splits each event into `active_segments_s`, so silent gaps inside a clip and the time before/
+after the event carry no label; (2) with `label_time_reference: reception` the label clock is the recording
+clock: a source emitted at t is heard R/c later, and the label position is where it was when the heard sound was
+emitted. metadata.json lists an event in a chunk only if one of its audible segments overlaps the chunk;
+`onset_s/offset_s` are the first/last audible instants (label clock), `emission_onset_s/emission_offset_s` the
+emission-clock window, and every trajectory sample has an `active` flag.
+
+
+## Update: N sub-arrays (default: 3 on a triangle)
+
+- `array.centers` accepts `{type: regular_polygon, n: 3, side_m: 10, z_offsets: [0,0,0]}` (or an explicit list).
+  Three sub-arrays remove the blind direction of a two-array layout (source on the line joining the arrays).
+- `FeatureConfig.inter_pairs` ("all" | "ref" | k) keeps only k cross-array pairs per array pair
+  (3 sub-arrays x 4 mics: 48 -> 6 pairs with k=2). Use the SAME `FeatureConfig` for features, labels, normalizer
+  and model (the TDOA label pair order follows it).
+- `python array_analysis.py --config example_config.yaml` now also prints a Monte-Carlo 3-D position-error table
+  vs azimuth for the layout.

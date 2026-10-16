@@ -81,8 +81,7 @@ from propagation import MediumConditions, true_tdoa_seconds
 from feature_extraction import (
     FeatureConfig,
     extract_features_from_chunk,
-    mic_pair_names,
-    _mic_pairs,
+    ordered_pairs,
 )
  
 CATEGORY_KEY_MAP = {
@@ -91,43 +90,52 @@ CATEGORY_KEY_MAP = {
 }
  
  
+def _segments_mask(times_abs: np.ndarray, segments) -> np.ndarray:
+    """True where `times_abs` falls inside ANY [a, b] segment."""
+    m = np.zeros(len(times_abs), dtype=bool)
+    for a, b in segments:
+        m |= (times_abs >= a) & (times_abs <= b)
+    return m
+
+
 def _interp_track(
     times_abs: np.ndarray,
     positions: np.ndarray,
     target_times_abs: np.ndarray,
-    onset_s: float,
-    offset_s: float,
+    segments,
 ):
     """
     Linearly interpolates one event's sparse position samples onto
-    `target_times_abs` (all in absolute episode time). Returns
-    (positions_interp (n_target, 3), active_mask (n_target,) bool),
-    where active_mask is True only where target time falls inside this
-    event's own [onset_s, offset_s] window (clipped separately by the
-    caller to the chunk being processed).
+    `target_times_abs` (absolute episode time). Returns
+    (positions_interp (n_target, 3), active_mask (n_target,) bool), where
+    active_mask is True ONLY while the source is actually audible, i.e.
+    inside one of the event's `active_segments_s` (see mixer.py). Outside
+    those segments -- before onset, after offset, and in silent gaps inside
+    the clip -- the frame carries NO label (activity False, class_id -1),
+    like DCASE's per-frame event activity.
     """
     target_times_abs = np.asarray(target_times_abs, dtype=np.float64)
-    active = (target_times_abs >= onset_s) & (target_times_abs <= offset_s)
- 
+    active = _segments_mask(target_times_abs, segments)
+
     out = np.zeros((len(target_times_abs), 3), dtype=np.float64)
     if len(times_abs) == 0:
         return out, np.zeros_like(active)
- 
+
     times_abs = np.asarray(times_abs, dtype=np.float64)
     positions = np.asarray(positions, dtype=np.float64)
     order = np.argsort(times_abs)
     times_sorted = times_abs[order]
     pos_sorted = positions[order]
- 
+
     if len(times_sorted) == 1:
         out[:] = pos_sorted[0]
     else:
         for k in range(3):
             out[:, k] = np.interp(target_times_abs, times_sorted, pos_sorted[:, k])
- 
+
     return out, active
- 
- 
+
+
 def _align_category(
     events_meta: List[Dict],
     frame_times_abs: np.ndarray,
@@ -136,9 +144,10 @@ def _align_category(
     medium: MediumConditions,
     max_tracks: int,
     valid_frame_mask: np.ndarray,
+    pairs: List,
 ) -> Dict:
     n_frames = len(frame_times_abs)
-    pair_names = mic_pair_names(mic_names)
+    pair_names = [f"{mic_names[i]}-{mic_names[j]}" for i, j in pairs]
     n_pairs = len(pair_names)
  
     position = np.zeros((n_frames, max_tracks, 3), dtype=np.float64)
@@ -158,7 +167,9 @@ def _align_category(
         )
  
     for track_idx, event in enumerate(events_meta):
-        onset_s, offset_s = event["onset_s"], event["offset_s"]
+        # audible time segments (reception time at the array); older datasets
+        # without them fall back to the whole [onset_s, offset_s] window
+        segments = event.get("active_segments_s") or [[event["onset_s"], event["offset_s"]]]
         samples = event["trajectory_samples"]
         if not samples:
             continue
@@ -167,7 +178,7 @@ def _align_category(
         positions = np.array([s["position_xyz_m"] for s in samples], dtype=np.float64)
         this_class_id = samples[0]["class_id"]
  
-        pos_interp, active = _interp_track(times_abs, positions, frame_times_abs, onset_s, offset_s)
+        pos_interp, active = _interp_track(times_abs, positions, frame_times_abs, segments)
         active = active & valid_frame_mask
  
         position[:, track_idx, :] = pos_interp
@@ -184,7 +195,7 @@ def _align_category(
         active_idx = np.where(active)[0]
         if len(active_idx) == 0:
             continue
-        for p_idx, (i, j) in enumerate(_mic_pairs(mic_names)):
+        for p_idx, (i, j) in enumerate(pairs):
             mic_a = np.asarray(mic_positions[mic_names[i]])
             mic_b = np.asarray(mic_positions[mic_names[j]])
             for f_idx in active_idx:
@@ -208,6 +219,9 @@ def align_labels_to_frames(
     mic_names: List[str],
     max_tracks: int = 3,
     categories: Optional[List[str]] = None,
+    pair_mode: str = "all",
+    mic_groups: Optional[List[str]] = None,
+    inter_pairs="all",
 ) -> Dict[str, Dict]:
     """
     metadata : the parsed metadata.json for ONE chunk (as returned inside
@@ -225,6 +239,9 @@ def align_labels_to_frames(
         "drone" and "known_unwanted" (the two categories mixer.py labels).
     """
     categories = categories or list(CATEGORY_KEY_MAP.keys())
+    # pair axis of the TDOA label = same order as the GCC feature's pair axis
+    # (grouped mode: intra pairs first, then inter pairs -- see ordered_pairs)
+    pairs = ordered_pairs(mic_names, pair_mode, mic_groups or metadata.get("mic_groups"), inter_pairs)
  
     chunk_t0 = metadata["episode_time_range_s"][0]
     chunk_t1 = metadata["episode_time_range_s"][1]
@@ -248,7 +265,7 @@ def align_labels_to_frames(
         events_meta = metadata.get(meta_key, [])
         out[category] = _align_category(
             events_meta, frame_times_abs, mic_names, mic_positions, medium,
-            max_tracks, valid_frame_mask,
+            max_tracks, valid_frame_mask, pairs,
         )
     return out
  
@@ -268,6 +285,8 @@ def load_aligned_example(
     labels = align_labels_to_frames(
         feats["metadata"], feats["frame_times_s"], feats["mic_names"],
         max_tracks=max_tracks, categories=categories,
+        pair_mode=feat_cfg.pair_mode, mic_groups=feats.get("mic_groups"),
+        inter_pairs=feat_cfg.inter_pairs,
     )
     return {"features": feats, "labels": labels}
  

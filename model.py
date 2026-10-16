@@ -79,13 +79,23 @@ import torch.nn.functional as F
 class ModelConfig:
     # --- structural dims: DO NOT guess these, infer from real data ---
     # (see infer_dims_from_batch() below) -- they depend on array geometry
-    # (n_mics, n_pairs) and FeatureConfig (n_mels, n_lags), which vary by
-    # dataset/config. No universally "sensible" default exists for these.
+    # (n_mics, pair counts) and FeatureConfig (n_mels, lag counts).
     n_mics: int
-    n_pairs: int
     n_mels: int
-    n_lags: int
- 
+
+    # GCC-PHAT input -- exactly ONE of the two layouts:
+    #  (a) legacy, FeatureConfig.pair_mode="all": one tensor batch["gcc_phat"]
+    n_pairs: int = 0
+    n_lags: int = 0
+    #  (b) grouped, pair_mode="grouped": batch["gcc_phat_intra"] (pairs inside one
+    #      sub-array: few lags, sub-sample interpolated) and batch["gcc_phat_inter"]
+    #      (pairs across sub-arrays: long baseline, many lags). Each gets its own
+    #      encoder. A layout without inter pairs (single array) leaves *_inter = 0.
+    n_pairs_intra: int = 0
+    n_lags_intra: int = 0
+    n_pairs_inter: int = 0
+    n_lags_inter: int = 0
+
     # --- dataset-dependent but with a reasonable default ---
     # n_classes=2 matches dataset_generator.py's DEFAULT flat-folder setup
     # (no per-class subfolders under assets/drone or assets/known_unwanted):
@@ -111,7 +121,13 @@ class ModelConfig:
     # peak sits IS the localization information.
     freq_pool: int = 4           # max-pool factor on the feature axis after each conv block
     logmel_freq_bins: int = 4    # bins kept per channel from the log-mel branch
-    gcc_freq_bins: int = 21 #32      # bins kept per channel from the GCC-PHAT branch
+    gcc_freq_bins: int = 32      # bins kept per channel from the GCC-PHAT branch (legacy layout)
+    # grouped layout: the INTRA lag axis is short (~100-150 interpolated lags), so
+    # it is pooled less; the INTER lag axis is long (~350-700 lags), pooled like legacy.
+    gcc_intra_freq_pool: int = 2
+    gcc_intra_freq_bins: int = 32
+    gcc_inter_freq_pool: int = 4
+    gcc_inter_freq_bins: int = 32
  
     # --- architecture knobs ---
     backbone: str = "crnn"        # "crnn" or "conformer" -- switchable, see module docstring
@@ -124,6 +140,14 @@ class ModelConfig:
     dropout: float = 0.1
  
     def __post_init__(self):
+        legacy = self.n_pairs > 0
+        grouped = (self.n_pairs_intra > 0) or (self.n_pairs_inter > 0)
+        if legacy == grouped:
+            raise ValueError(
+                "ModelConfig needs exactly one GCC layout: n_pairs/n_lags (legacy 'gcc_phat') "
+                "OR n_pairs_intra/n_lags_intra and/or n_pairs_inter/n_lags_inter (grouped). "
+                "Use infer_dims_from_batch(batch) to fill them."
+            )
         if self.backbone not in ("crnn", "conformer"):
             raise ValueError(f"backbone must be 'crnn' or 'conformer', got '{self.backbone}'")
         if self.backbone == "conformer" and self.d_model % self.n_heads != 0:
@@ -141,14 +165,18 @@ def infer_dims_from_batch(batch: Dict[str, torch.Tensor]) -> Dict[str, int]:
         dims = infer_dims_from_batch(batch)
         cfg = ModelConfig(**dims, n_classes=len(class_map), max_tracks=3)
     """
-    return {
-        "n_mics": batch["logmel"].shape[1],
-        "n_mels": batch["logmel"].shape[3],
-        "n_pairs": batch["gcc_phat"].shape[1],
-        "n_lags": batch["gcc_phat"].shape[3],
-    }
- 
- 
+    dims = {"n_mics": batch["logmel"].shape[1], "n_mels": batch["logmel"].shape[3]}
+    if "gcc_phat" in batch:
+        dims.update(n_pairs=batch["gcc_phat"].shape[1], n_lags=batch["gcc_phat"].shape[3])
+    if "gcc_phat_intra" in batch:
+        dims.update(n_pairs_intra=batch["gcc_phat_intra"].shape[1],
+                    n_lags_intra=batch["gcc_phat_intra"].shape[3])
+    if "gcc_phat_inter" in batch:
+        dims.update(n_pairs_inter=batch["gcc_phat_inter"].shape[1],
+                    n_lags_inter=batch["gcc_phat_inter"].shape[3])
+    return dims
+
+
 # ---------------------------------------------------------------------------
 # Causal Conv2d building block (shared by both feature-branch encoders)
 # ---------------------------------------------------------------------------
@@ -365,10 +393,26 @@ class SELDModel(nn.Module):
         self.logmel_encoder = FeatureCNNEncoder(
             cfg.n_mics, cfg.cnn_channels, cfg.causal, cfg.dropout,
             freq_pool=cfg.freq_pool, out_freq_bins=cfg.logmel_freq_bins)
-        self.gcc_encoder = FeatureCNNEncoder(
-            cfg.n_pairs, cfg.cnn_channels, cfg.causal, cfg.dropout,
-            freq_pool=cfg.freq_pool, out_freq_bins=cfg.gcc_freq_bins)
-        self.input_proj = nn.Linear(2 * cfg.cnn_channels, cfg.d_model)
+        self.legacy_gcc = cfg.n_pairs > 0
+        self.gcc_encoder = None
+        self.gcc_intra_encoder = None
+        self.gcc_inter_encoder = None
+        if self.legacy_gcc:
+            self.gcc_encoder = FeatureCNNEncoder(
+                cfg.n_pairs, cfg.cnn_channels, cfg.causal, cfg.dropout,
+                freq_pool=cfg.freq_pool, out_freq_bins=cfg.gcc_freq_bins)
+        else:
+            if cfg.n_pairs_intra > 0:
+                self.gcc_intra_encoder = FeatureCNNEncoder(
+                    cfg.n_pairs_intra, cfg.cnn_channels, cfg.causal, cfg.dropout,
+                    freq_pool=cfg.gcc_intra_freq_pool, out_freq_bins=cfg.gcc_intra_freq_bins)
+            if cfg.n_pairs_inter > 0:
+                self.gcc_inter_encoder = FeatureCNNEncoder(
+                    cfg.n_pairs_inter, cfg.cnn_channels, cfg.causal, cfg.dropout,
+                    freq_pool=cfg.gcc_inter_freq_pool, out_freq_bins=cfg.gcc_inter_freq_bins)
+        n_branches = 1 + sum(e is not None for e in
+                             (self.gcc_encoder, self.gcc_intra_encoder, self.gcc_inter_encoder))
+        self.input_proj = nn.Linear(n_branches * cfg.cnn_channels, cfg.d_model)
  
         if cfg.backbone == "crnn":
             self.temporal = CRNNBackbone(cfg.d_model, cfg.n_temporal_layers, cfg.causal, cfg.dropout)
@@ -381,26 +425,45 @@ class SELDModel(nn.Module):
         self.position_head = nn.Linear(cfg.d_model, cfg.max_tracks * 3)
         self.class_head = nn.Linear(cfg.d_model, cfg.max_tracks * cfg.n_classes)
  
-    def forward(self, logmel: torch.Tensor, gcc_phat: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        logmel: torch.Tensor,
+        gcc_phat: Optional[torch.Tensor] = None,
+        gcc_phat_intra: Optional[torch.Tensor] = None,
+        gcc_phat_inter: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
-        logmel   : (B, n_mics, n_frames, n_mels)   -- e.g. batch["logmel"] from torch_dataset.py
-        gcc_phat : (B, n_pairs, n_frames, n_lags)  -- e.g. batch["gcc_phat"]
- 
-        Returns a dict with exactly the keys/shapes pit_loss.py's
-        pit_loss_single_category expects for `pred`.
+        logmel         : (B, n_mics, n_frames, n_mels)
+        gcc_phat       : (B, n_pairs, n_frames, n_lags)        -- legacy layout only
+        gcc_phat_intra : (B, n_pairs_intra, n_frames, n_lags_i) -- grouped layout
+        gcc_phat_inter : (B, n_pairs_inter, n_frames, n_lags_o) -- grouped layout
+        (or simply model.forward_batch(batch)). Returns a dict with exactly the
+        keys/shapes pit_loss.py's pit_loss_single_category expects for `pred`.
         """
-        a = self.logmel_encoder(logmel)   # (B, T, cnn_channels)
-        b = self.gcc_encoder(gcc_phat)    # (B, T, cnn_channels)
-        x = torch.cat([a, b], dim=-1)     # (B, T, 2*cnn_channels)
+        parts = [self.logmel_encoder(logmel)]               # (B, T, cnn_channels)
+        for enc, feat, name in ((self.gcc_encoder, gcc_phat, "gcc_phat"),
+                                (self.gcc_intra_encoder, gcc_phat_intra, "gcc_phat_intra"),
+                                (self.gcc_inter_encoder, gcc_phat_inter, "gcc_phat_inter")):
+            if enc is None:
+                continue
+            if feat is None:
+                raise ValueError(f"this model was built with a '{name}' branch but no '{name}' tensor was passed")
+            parts.append(enc(feat))
+        x = torch.cat(parts, dim=-1)      # (B, T, n_branches*cnn_channels)
         x = self.input_proj(x)            # (B, T, d_model)
         x = self.temporal(x)              # (B, T, d_model)
- 
+
         B, T, _ = x.shape
         activity_logit = self.activity_head(x)                                    # (B, T, max_tracks)
         position = self.position_head(x).view(B, T, self.cfg.max_tracks, 3)        # (B, T, max_tracks, 3)
         class_logit = self.class_head(x).view(B, T, self.cfg.max_tracks, self.cfg.n_classes)
  
         return {"position": position, "activity_logit": activity_logit, "class_logit": class_logit}
+
+    def forward_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Convenience for either layout: model.forward_batch(batch)."""
+        return self(batch["logmel"], batch.get("gcc_phat"),
+                    batch.get("gcc_phat_intra"), batch.get("gcc_phat_inter"))
  
  
 def build_model(cfg: ModelConfig) -> SELDModel:
@@ -408,58 +471,58 @@ def build_model(cfg: ModelConfig) -> SELDModel:
  
  
 if __name__ == "__main__":
-    # Self-check with synthetic tensors (no dataset needed), in the same
-    # spirit as validate_gcc_phat.py / pit_loss.py / streaming_tracker.py's
-    # own standalone checks:
+    # Self-check with synthetic tensors (no dataset needed):
     #   1. output shapes match what pit_loss.py expects
-    #   2. gradients flow into both feature encoders
-    #   3. CAUSALITY: with causal=True, changing a FUTURE frame's input
-    #      must not change an EARLIER frame's output (up to float error) --
-    #      this is the property streaming_tracker.py's whole design
+    #   2. gradients flow into every feature encoder
+    #   3. CAUSALITY: with causal=True, changing a FUTURE frame's input must not
+    #      change an EARLIER frame's output -- the property streaming_tracker.py
     #      depends on.
+    # Runs for both GCC layouts (legacy single tensor / grouped intra+inter).
     torch.manual_seed(0)
     B, T = 2, 40
-    n_mics, n_pairs, n_mels, n_lags, n_classes = 4, 6, 64, 129, 2
- 
-    for backbone in ("crnn", "conformer"):
-        print(f"--- backbone={backbone} ---")
-        cfg = ModelConfig(
-            n_mics=n_mics, n_pairs=n_pairs, n_mels=n_mels, n_lags=n_lags,
-            n_classes=n_classes, max_tracks=3, backbone=backbone, causal=True,
-            d_model=32, cnn_channels=16, n_temporal_layers=2, n_heads=4,
-        )
-        model = build_model(cfg)
- 
-        logmel = torch.randn(B, n_mics, T, n_mels, requires_grad=True)
-        gcc = torch.randn(B, n_pairs, T, n_lags, requires_grad=True)
- 
-        out = model(logmel, gcc)
-        print(f"position shape       : {tuple(out['position'].shape)}  (expect {(B, T, cfg.max_tracks, 3)})")
-        print(f"activity_logit shape : {tuple(out['activity_logit'].shape)}  (expect {(B, T, cfg.max_tracks)})")
-        print(f"class_logit shape    : {tuple(out['class_logit'].shape)}  (expect {(B, T, cfg.max_tracks, cfg.n_classes)})")
- 
-        out["position"].sum().backward()
-        print(f"grad flows to logmel input : {logmel.grad is not None}")
-        print(f"grad flows to gcc input    : {gcc.grad is not None}")
- 
-        # causality check: eval mode (freeze BatchNorm/Dropout randomness),
-        # perturb only the LAST frame of the input, verify EARLIER frames
-        # of the output are unchanged.
-        model.eval()
-        with torch.no_grad():
-            logmel_a = torch.randn(1, n_mics, T, n_mels)
-            gcc_a = torch.randn(1, n_pairs, T, n_lags)
-            out_a = model(logmel_a, gcc_a)
- 
-            logmel_b = logmel_a.clone()
-            gcc_b = gcc_a.clone()
-            logmel_b[:, :, -1, :] += 5.0   # perturb only the LAST (future-most) frame
-            gcc_b[:, :, -1, :] += 5.0
-            out_b = model(logmel_b, gcc_b)
- 
-            earlier_diff = (out_a["position"][:, :-1] - out_b["position"][:, :-1]).abs().max().item()
-            print(f"max diff in EARLIER frames after perturbing the LAST frame: {earlier_diff:.2e}  "
-                  f"({'PASS' if earlier_diff < 1e-5 else 'FAIL'} -- should be ~0 for a causal model)")
-        model.train()
-        print()
- 
+    n_mics, n_mels, n_classes = 8, 64, 2
+    layouts = {
+        "legacy":  dict(n_pairs=28, n_lags=129),
+        "grouped": dict(n_pairs_intra=12, n_lags_intra=109, n_pairs_inter=16, n_lags_inter=351),
+    }
+
+    def make_inputs(dims, requires_grad=False):
+        x = {"logmel": torch.randn(B, n_mics, T, n_mels, requires_grad=requires_grad)}
+        if "n_pairs" in dims:
+            x["gcc_phat"] = torch.randn(B, dims["n_pairs"], T, dims["n_lags"], requires_grad=requires_grad)
+        if "n_pairs_intra" in dims:
+            x["gcc_phat_intra"] = torch.randn(B, dims["n_pairs_intra"], T, dims["n_lags_intra"], requires_grad=requires_grad)
+            x["gcc_phat_inter"] = torch.randn(B, dims["n_pairs_inter"], T, dims["n_lags_inter"], requires_grad=requires_grad)
+        return x
+
+    for layout, dims in layouts.items():
+        for backbone in ("crnn", "conformer"):
+            print(f"--- layout={layout}, backbone={backbone} ---")
+            cfg = ModelConfig(
+                n_mics=n_mics, n_mels=n_mels, **dims,
+                n_classes=n_classes, max_tracks=3, backbone=backbone, causal=True,
+                d_model=32, cnn_channels=16, n_temporal_layers=2, n_heads=4,
+            )
+            model = build_model(cfg)
+            inp = make_inputs(dims, requires_grad=True)
+            assert infer_dims_from_batch(inp) == {"n_mics": n_mics, "n_mels": n_mels, **dims}
+            out = model.forward_batch(inp)
+            print(f"position shape       : {tuple(out['position'].shape)}  (expect {(B, T, cfg.max_tracks, 3)})")
+            print(f"activity_logit shape : {tuple(out['activity_logit'].shape)}  (expect {(B, T, cfg.max_tracks)})")
+            print(f"class_logit shape    : {tuple(out['class_logit'].shape)}  (expect {(B, T, cfg.max_tracks, cfg.n_classes)})")
+            out["position"].sum().backward()
+            for k, v in inp.items():
+                print(f"grad flows to {k:15s}: {v.grad is not None}")
+
+            model.eval()
+            with torch.no_grad():
+                a = make_inputs(dims)
+                out_a = model.forward_batch(a)
+                b = {k: v.clone() for k, v in a.items()}
+                for v in b.values():
+                    v[:, :, -1, :] += 5.0       # perturb only the LAST frame
+                out_b = model.forward_batch(b)
+                diff = (out_a["position"][:, :-1] - out_b["position"][:, :-1]).abs().max().item()
+                print(f"max diff in EARLIER frames after perturbing the LAST frame: {diff:.2e}  "
+                      f"({'PASS' if diff < 1e-5 else 'FAIL'} -- should be ~0 for a causal model)")
+            print()

@@ -54,6 +54,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import soundfile as sf
 from scipy.signal import stft
+
+from array_geometry import infer_mic_groups, split_pairs_by_group
  
  
 # ---------------------------------------------------------------------------
@@ -81,6 +83,25 @@ class FeatureConfig:
     max_tau_s: Optional[float] = None
     default_max_tau_s: float = 0.0015   # 1.5 ms fallback (~0.5 m mic spacing)
     v_sound: float = 343.0
+
+    # --- pair handling -------------------------------------------------
+    # "all"     : legacy -- ONE GCC-PHAT tensor over every mic pair, one
+    #             shared lag window (sized by the longest pair).
+    # "grouped" : pairs are split into INTRA-array (same sub-array) and
+    #             INTER-array (different sub-arrays), each with its OWN lag
+    #             window and its own tensor: feats["gcc_phat_intra"] and
+    #             feats["gcc_phat_inter"]. Needed for distributed arrays:
+    #             a compact sub-array only has a few meaningful lags (e.g.
+    #             +/-6 samples), which a shared +/-175-sample window
+    #             squeezes into a handful of bins out of ~350.
+    pair_mode: str = "all"
+    gcc_interp_intra: int = 8   # sub-sample interpolation of the correlation
+                                # (zero-padded irfft). Integer-lag GCC-PHAT on
+                                # a 4-8 cm array gives ~10 deg bearing steps.
+    gcc_interp_inter: int = 1   # long baseline already has ~140 lags: no need
+    inter_pairs: object = "all" # which cross-array pairs to keep: "all" | "ref" | k (int);
+                                # see array_geometry.split_pairs_by_group. With 3+ sub-arrays
+                                # "ref"/2 cuts the inter-branch input from 48 to 3/6 pairs.
  
  
 # ---------------------------------------------------------------------------
@@ -262,6 +283,84 @@ def compute_gcc_phat_framewise(
     return gcc, pair_names, lags_s
  
  
+def _max_tau_for_pairs(cfg, pairs, mic_names, mic_positions) -> float:
+    if cfg.max_tau_s is not None:
+        return cfg.max_tau_s
+    if mic_positions is not None and pairs:
+        dmax = max(float(np.linalg.norm(np.asarray(mic_positions[mic_names[i]])
+                                        - np.asarray(mic_positions[mic_names[j]])))
+                   for i, j in pairs)
+        if dmax > 0:
+            return 1.2 * dmax / cfg.v_sound   # +20% margin
+    return cfg.default_max_tau_s
+
+
+def compute_gcc_phat_for_pairs(
+    Zxx: np.ndarray, fs: float, mic_names: List[str], pairs: List[Tuple[int, int]],
+    cfg: FeatureConfig, max_tau_s: float, interp: int = 1,
+):
+    """
+    Frame-wise GCC-PHAT for an explicit list of (i, j) pairs, with its own
+    lag window and an optional sub-sample interpolation factor.
+
+    interp > 1: the PHAT-normalised cross-spectrum is zero-padded to
+    n_fft * interp points before the inverse FFT, which band-limited-
+    interpolates the correlation function (lag step = 1 / (fs * interp)).
+    Amplitude is rescaled by `interp` so values stay comparable.
+
+    Returns (gcc (n_pairs, n_frames, n_lags), pair_names, lags_s (n_lags,)).
+    """
+    n_mics, n_freqs, n_frames = Zxx.shape
+    n_ifft = cfg.n_fft * interp
+    requested = int(round(max_tau_s * fs * interp))
+    max_shift = max(1, min(requested, n_ifft // 2))
+    if requested > n_ifft // 2:
+        warnings.warn(f"GCC-PHAT lag window (+/-{requested} lags) exceeds what "
+                      f"n_fft*interp={n_ifft} resolves; clamped to +/-{n_ifft // 2}.", stacklevel=2)
+    gcc = np.zeros((len(pairs), n_frames, 2 * max_shift + 1), dtype=np.float64)
+    for p_idx, (i, j) in enumerate(pairs):
+        R = Zxx[i] * np.conj(Zxx[j])
+        R = R / np.maximum(np.abs(R), 1e-12)
+        cc = np.fft.irfft(R, n=n_ifft, axis=0) * interp          # (n_ifft, n_frames)
+        wrapped = np.concatenate([cc[-max_shift:, :], cc[: max_shift + 1, :]], axis=0)
+        gcc[p_idx] = wrapped.T
+    names = [f"{mic_names[i]}-{mic_names[j]}" for i, j in pairs]
+    lags_s = np.arange(-max_shift, max_shift + 1) / (float(fs) * interp)
+    return gcc, names, lags_s
+
+
+def compute_gcc_phat_grouped(Zxx, fs, mic_names, cfg, mic_positions=None, mic_groups=None) -> Dict:
+    """INTRA-array and INTER-array GCC-PHAT, each with its own lag window.
+    A scope with no pairs (e.g. INTER for a single array) is omitted."""
+    intra, inter = split_pairs_by_group(mic_names, mic_groups, cfg.inter_pairs)
+    out = {}
+    for scope, pairs, interp in (("intra", intra, cfg.gcc_interp_intra),
+                                 ("inter", inter, cfg.gcc_interp_inter)):
+        if not pairs:
+            continue
+        tau = _max_tau_for_pairs(cfg, pairs, mic_names, mic_positions)
+        g, names, lags = compute_gcc_phat_for_pairs(Zxx, fs, mic_names, pairs, cfg, tau, interp)
+        out[scope] = {"gcc": g, "pair_names": names, "lags_s": lags}
+    return out
+
+
+def ordered_pairs(mic_names: List[str], pair_mode: str = "all",
+                  mic_groups: Optional[List[str]] = None,
+                  inter_pairs="all") -> List[Tuple[int, int]]:
+    """
+    Single source of truth for the ORDER of mic pairs in pair-indexed
+    tensors (e.g. the TDOA label of label_alignment.py).
+      "all"     -> all pairs, lexicographic (legacy order)
+      "grouped" -> INTRA-array pairs first, then INTER-array pairs; i.e. the
+                   concatenation of feats["gcc_phat_intra"] and
+                   feats["gcc_phat_inter"] along the pair axis.
+    """
+    if pair_mode == "grouped":
+        intra, inter = split_pairs_by_group(mic_names, mic_groups, inter_pairs)
+        return intra + inter
+    return _mic_pairs(mic_names)
+
+
 # ---------------------------------------------------------------------------
 # Top-level entry points
 # ---------------------------------------------------------------------------
@@ -272,6 +371,7 @@ def extract_features(
     mic_names: List[str],
     cfg: FeatureConfig = FeatureConfig(),
     mic_positions: Optional[Dict[str, np.ndarray]] = None,
+    mic_groups: Optional[List[str]] = None,
 ) -> Dict:
     """
     multichannel : np.ndarray, shape (n_samples, n_mics) -- e.g. what
@@ -285,6 +385,24 @@ def extract_features(
     freqs, frame_times_s, Zxx = _shared_stft(mc, fs, cfg)
  
     logmel = compute_logmel(Zxx, fs, cfg)
+
+    if cfg.pair_mode == "grouped":
+        grouped = compute_gcc_phat_grouped(Zxx, fs, mic_names, cfg, mic_positions, mic_groups)
+        out = {
+            "logmel": logmel,
+            "mic_names": list(mic_names),
+            "mic_groups": list(mic_groups or infer_mic_groups(mic_names)),
+            "frame_times_s": frame_times_s,
+            "fs": fs, "n_fft": cfg.n_fft, "hop_length": cfg.hop_length,
+            "mic_pair_names": [],
+        }
+        for scope, d in grouped.items():          # intra first, then inter
+            out[f"gcc_phat_{scope}"] = d["gcc"]    # (n_pairs_scope, n_frames, n_lags_scope)
+            out[f"mic_pair_names_{scope}"] = d["pair_names"]
+            out[f"gcc_lags_s_{scope}"] = d["lags_s"]
+            out["mic_pair_names"] += d["pair_names"]
+        return out
+
     gcc, pair_names, lags_s = compute_gcc_phat_framewise(Zxx, fs, mic_names, cfg, mic_positions)
  
     return {
@@ -320,7 +438,8 @@ def extract_features_from_chunk(chunk_dir: str, cfg: FeatureConfig = FeatureConf
     mic_names = metadata["mic_channel_order"]
     mic_positions = {k: np.array(v) for k, v in metadata["mic_positions_m"].items()}
  
-    feats = extract_features(multichannel, fs, mic_names, cfg, mic_positions)
+    feats = extract_features(multichannel, fs, mic_names, cfg, mic_positions,
+                             mic_groups=metadata.get("mic_groups"))
     feats["chunk_dir"] = chunk_dir
     feats["metadata"] = metadata
     return feats

@@ -13,6 +13,14 @@ apply_air_absorption: true
 moving_block_size: 2048        # OLA block size (samples) for moving-source propagation
 metadata_dt_s: 0.05            # ground-truth trajectory/TDOA label rate (20 Hz)
 event_fade_s: 0.05             # short onset/offset fade (seconds) so entries/exits don't click
+# --- DCASE-style labels: a source is labelled ONLY while audible ---
+label_time_reference: reception   # "reception": label clock = recording clock (accounts for R/c delay,
+                                  #   position = where the source was when the heard sound was emitted);
+                                  # "emission": legacy
+label_vad_db: 30.0                # VAD threshold (dB below clip RMS); null = whole event window is active
+label_vad_frame_s: 0.02
+label_min_gap_s: 0.10             # silent gaps shorter than this are bridged
+label_min_segment_s: 0.10         # active runs shorter than this are dropped
 n_workers: 1                   # 1 = sequential (single process, easiest to debug);
                                 # 0 = use ALL available CPU cores; N = use exactly N worker
                                 # processes. Episodes render independently in parallel, and
@@ -48,12 +56,19 @@ array:
   type: distributed_sub_arrays
   sub_array_type: tetrahedral
   sub_array_params:
-    radius_m: 0.04
+    radius_m: 0.05          # compact sub-array: longest pair 10 cm -> tonal-ambiguity limit ~1.7 kHz,
+                            # lag window +/-7 samples. See `python array_analysis.py --config ...`
+  # THREE sub-arrays on an equilateral triangle (side 10 m). Two arrays are blind when the source lies
+  # on the line joining them (range error explodes); three remove that blind direction.
+  # z_offsets lifts individual arrays (e.g. [0, 0, 3] = one array on a 3 m mast) to get height parallax.
+  # An explicit list also works: centers: [[x,y,z], [x,y,z], ...]
   centers:
-    - [1.0, 0.0, 0.0]
-    - [-1.0, 0.0, 0.0]
-  array_prefixes: ["arrA", "arrB"]
- 
+    type: regular_polygon
+    n: 3
+    side_m: 10.0
+    z_offsets: [0.0, 0.0, 0.0]
+  array_prefixes: ["arrA", "arrB", "arrC"]
+
 ground_reflection:
   enabled: false                    # off by default (matches the reference paper's setup)
   ground_z: 0.0
