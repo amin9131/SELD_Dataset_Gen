@@ -129,20 +129,57 @@ def main():
     # model dims come from one real example (nothing is guessed)
     base = train_ds.dataset if isinstance(train_ds, Subset) else train_ds
     item = base[0]
-    n_mics, n_mels = item["logmel"].shape[0], item["logmel"].shape[2]
-    n_pairs, n_lags = item["gcc_phat"].shape[0], item["gcc_phat"].shape[2]
-    fp = 4
+    # print("\nDEBUG: dataset item keys =", list(item.keys()))
+
+    # for key, value in item.items():
+    #     if hasattr(value, "shape"):
+    #         print(f"{key}: shape={value.shape}, dtype={value.dtype}")
+    #     else:
+    #         print(f"{key}: type={type(value)}")
+    # n_mics, n_mels = item["logmel"].shape[0], item["logmel"].shape[2]
+    # n_pairs, n_lags = item["gcc_phat"].shape[0], item["gcc_phat"].shape[2]
+    
+    # fp = 4
+    # model_cfg = ModelConfig(
+    #     n_mics=n_mics, n_pairs=n_pairs, n_mels=n_mels, n_lags=n_lags,
+    #     n_classes=n_classes, max_tracks=len(CATEGORIES) * args.max_tracks,
+    #     backbone=args.backbone, causal=not args.non_causal, d_model=args.d_model,
+    #     freq_pool=fp, logmel_freq_bins=min(4, n_mels // fp ** 2),
+    #     gcc_freq_bins=min(32, n_lags // fp ** 2),   # 351 lags -> 21 bins after two pools
+    # )
+    n_mics = item["logmel"].shape[0]
+    n_mels = item["logmel"].shape[2]
+
     model_cfg = ModelConfig(
-        n_mics=n_mics, n_pairs=n_pairs, n_mels=n_mels, n_lags=n_lags,
-        n_classes=n_classes, max_tracks=len(CATEGORIES) * args.max_tracks,
-        backbone=args.backbone, causal=not args.non_causal, d_model=args.d_model,
-        freq_pool=fp, logmel_freq_bins=min(4, n_mels // fp ** 2),
-        gcc_freq_bins=min(32, n_lags // fp ** 2),   # 351 lags -> 21 bins after two pools
+        n_mics=n_mics,
+        n_mels=n_mels,
+
+        n_pairs_intra=item["gcc_phat_intra"].shape[0],
+        n_lags_intra=item["gcc_phat_intra"].shape[2],
+
+        n_pairs_inter=item["gcc_phat_inter"].shape[0],
+        n_lags_inter=item["gcc_phat_inter"].shape[2],
+
+        n_classes=n_classes,
+        max_tracks=len(CATEGORIES) * args.max_tracks,
+        backbone=args.backbone,
+        causal=not args.non_causal,
+        d_model=args.d_model,
+        freq_pool=4,
+        logmel_freq_bins=min(4, n_mels // 16),
+        gcc_intra_freq_pool=2,
+        gcc_intra_freq_bins=32,
+        gcc_inter_freq_pool=4,
+        gcc_inter_freq_bins=32,
     )
     model = build_model(model_cfg).to(device)
     print(f"device={device} | train chunks={len(train_ds)} val chunks={len(val_ds)} | "
           f"params={sum(p.numel() for p in model.parameters()):,} | "
-          f"mics={n_mics} pairs={n_pairs} mels={n_mels} lags={n_lags} classes={n_classes} "
+        #   f"mics={n_mics} pairs={n_pairs} mels={n_mels} lags={n_lags} classes={n_classes} "
+          f"mics={n_mics} intra_pairs={model_cfg.n_pairs_intra} "
+          f"intra_lags={model_cfg.n_lags_intra} "
+          f"inter_pairs={model_cfg.n_pairs_inter} "
+          f"inter_lags={model_cfg.n_lags_inter} classes={n_classes} "
           f"slots={model_cfg.max_tracks}")
 
     kw = dict(persistent_workers=True) if args.num_workers > 0 else {}
@@ -169,7 +206,12 @@ def main():
         run, n = 0.0, 0
         for batch in train_loader:
             b = to_device(batch, device)
-            pred = model(b["logmel"], b["gcc_phat"])
+            # pred = model(b["logmel"], b["gcc_phat"])
+            pred = model(
+            logmel=b["logmel"],
+            gcc_phat_intra=b["gcc_phat_intra"],
+            gcc_phat_inter=b["gcc_phat_inter"],
+        )
             tgt, _ = make_targets(b, args.pos_scale)
             loss = pit_loss_single_category(pred, tgt, pit_cfg)["loss"]
             opt.zero_grad(set_to_none=True)

@@ -130,7 +130,7 @@ class ModelConfig:
     gcc_inter_freq_bins: int = 32
  
     # --- architecture knobs ---
-    backbone: str = "crnn"        # "crnn" or "conformer" -- switchable, see module docstring
+    backbone: str = "conformer"        # "crnn" or "conformer" -- switchable, see module docstring
     causal: bool = True           # see "Causality and streaming" above
     d_model: int = 128
     cnn_channels: int = 64        # output channels of EACH feature-branch CNN encoder

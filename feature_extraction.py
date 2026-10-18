@@ -94,12 +94,12 @@ class FeatureConfig:
     #             a compact sub-array only has a few meaningful lags (e.g.
     #             +/-6 samples), which a shared +/-175-sample window
     #             squeezes into a handful of bins out of ~350.
-    pair_mode: str = "all"
+    pair_mode: str = "grouped"
     gcc_interp_intra: int = 8   # sub-sample interpolation of the correlation
                                 # (zero-padded irfft). Integer-lag GCC-PHAT on
                                 # a 4-8 cm array gives ~10 deg bearing steps.
     gcc_interp_inter: int = 1   # long baseline already has ~140 lags: no need
-    inter_pairs: object = "all" # which cross-array pairs to keep: "all" | "ref" | k (int);
+    inter_pairs: object = 2 # which cross-array pairs to keep: "all" | "ref" | k (int);
                                 # see array_geometry.split_pairs_by_group. With 3+ sub-arrays
                                 # "ref"/2 cuts the inter-branch input from 48 to 3/6 pairs.
  

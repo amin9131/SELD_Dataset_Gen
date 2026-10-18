@@ -48,9 +48,9 @@ split:
   split_seed: 123                 # independent of master_seed, so changing episode-sampling
                                    # parameters never accidentally reshuffles the file split
   n_episodes:
-    train: 140
-    val: 30
-    test: 30
+    train: 500
+    val: 120
+    test: 120
  
 array:
   type: distributed_sub_arrays
@@ -90,7 +90,7 @@ assets:
   known_unwanted_dir: "./assets/known_unwanted"
  
 episode:
-  episode_duration_s_range: [15.0, 25.0]   # one continuous simulated flight
+  episode_duration_s_range: [40.0, 60.0]   # one continuous simulated flight
   chunk_duration_s: 4.0                    # each flight is sliced into 4s training clips
  
   # --- drones appear and disappear at random times during the episode ---
@@ -114,7 +114,7 @@ episode:
  
   interferer_position_range:
     use_shell: true
-    radius_range: [3.0, 30.0]
+    radius_range: [3.0, 40.0]
     azimuth_range_deg: [0.0, 360.0]
     elevation_range_deg: [0.0, 30.0]
  
@@ -125,11 +125,11 @@ episode:
       linear_flyby: 0.25       # straight-line approach/recede/overflight
       waypoint_mission: 0.35   # multi-leg mission with realistic accel/cruise/decel legs
       orbit: 0.2               # circling a point of interest (surveillance loiter)
-    v_max_range_mps: [3.0, 18.0]
+    v_max_range_mps: [3.0, 36.0]
     a_max_range_mps2: [1.5, 4.0]
     hover_jitter_std_range_m: [0.2, 1.2]
     orbit_radius_range_m: [5.0, 30.0]
-    n_waypoints_range: [2, 4]
+    n_waypoints_range: [2, 6]
     waypoint_hover_dwell_range_s: [0.0, 2.0]
  
   # --- interferer motion: simpler mixture (e.g. a bird or car passing by) ---
@@ -139,7 +139,7 @@ episode:
       linear_flyby: 0.5
       waypoint_mission: 0.0
       orbit: 0.0
-    v_max_range_mps: [1.0, 10.0]
+    v_max_range_mps: [1.0, 20.0]
     a_max_range_mps2: [1.0, 3.0]
     hover_jitter_std_range_m: [0.1, 0.8]
     orbit_radius_range_m: [5.0, 20.0]

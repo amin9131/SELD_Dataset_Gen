@@ -28,7 +28,7 @@ def pair_report(mic_positions, fs, c=343.0):
     groups = ag.infer_mic_groups(names)
     glist = list(dict.fromkeys(groups))
     print(f"{len(names)} mics in {len(glist)} group(s) {glist}, fs={fs} Hz, c={c} m/s")
-    intra, inter = ag.split_pairs_by_group(names, groups, "all")
+    intra, inter = ag.split_pairs_by_group(names, groups, "ref") # "all" - "ref" - k
     for label, pairs in (("INTRA", intra), ("INTER (all pairs)", inter)):
         if not pairs:
             print(f"\n[{label}] no pairs")

@@ -77,7 +77,12 @@ def evaluate_model(model, loader, device, pos_scale, centroid, n_slots_per_categ
 
     for batch in loader:
         b = to_device(batch, device)
-        pred = model(b["logmel"], b["gcc_phat"])
+        # pred = model(b["logmel"], b["gcc_phat"])
+        pred = model(
+        logmel=b["logmel"],
+        gcc_phat_intra=b["gcc_phat_intra"],
+        gcc_phat_inter=b["gcc_phat_inter"],
+    )
         tgt, tgt_m = make_targets(b, pos_scale)
         out = pit_loss_single_category(pred, tgt, pit_cfg)
         B = b["logmel"].shape[0]

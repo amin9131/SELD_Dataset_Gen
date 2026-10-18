@@ -129,7 +129,7 @@ def infer_mic_groups(mic_names: List[str]) -> List[str]:
     return [n.split("_")[0] if "_" in n else "all" for n in mic_names]
 
 
-def split_pairs_by_group(mic_names: List[str], groups: List[str] = None, inter_pairs="all"):
+def split_pairs_by_group(mic_names: List[str], groups: List[str] = None, inter_pairs= "all"): # inter_pairs="all"
     """
     Returns (intra_pairs, inter_pairs_list): lists of (i, j) index pairs.
 
