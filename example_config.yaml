@@ -48,9 +48,9 @@ split:
   split_seed: 123                 # independent of master_seed, so changing episode-sampling
                                    # parameters never accidentally reshuffles the file split
   n_episodes:
-    train: 500
-    val: 120
-    test: 120
+    train: 50
+    val: 15
+    test: 15
  
 array:
   type: distributed_sub_arrays

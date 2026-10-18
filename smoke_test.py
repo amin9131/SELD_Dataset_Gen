@@ -14,7 +14,7 @@ a = ap.parse_args()
 inter = a.inter_pairs if a.inter_pairs in ("all", "ref") else int(a.inter_pairs)
 
 fc = FeatureConfig(pair_mode="grouped", n_fft=a.n_fft, hop_length=a.n_fft // 2, inter_pairs=inter)
-norm = FeatureNormalizer().fit(a.train_dir, fc, max_chunks=50)     # fit on TRAIN only
+norm = FeatureNormalizer().fit(a.train_dir, fc, max_chunks=50, n_workers=1)     # fit on TRAIN only
 norm.save(f"{a.train_dir}/feature_norm_stats.json")
 ds = SELDDataset(a.train_dir, fc, max_tracks=3, normalizer=norm)
 batch = next(iter(build_dataloader(ds, batch_size=4, shuffle=True)))

@@ -49,6 +49,8 @@ from torch.utils.data import DataLoader, Dataset
 from feature_extraction import FeatureConfig
 from feature_normalization import FeatureNormalizer
 from label_alignment import load_aligned_example
+from feature_cache import (CATEGORIES, GCC_KEYS, cache_path,
+                           example_to_arrays, load_cached)
  
  
 def find_chunk_dirs(dataset_dir: str) -> List[str]:
@@ -78,6 +80,7 @@ class SELDDataset(Dataset):
         max_tracks: int = 3,
         categories: Optional[List[str]] = None,
         normalizer: Optional[FeatureNormalizer] = None,
+        use_cache: bool = True,
     ):
         self.chunk_dirs = find_chunk_dirs(dataset_dir)
         if not self.chunk_dirs:
@@ -89,36 +92,64 @@ class SELDDataset(Dataset):
         self.max_tracks = max_tracks
         self.categories = categories
         self.normalizer = normalizer
+        self.use_cache = use_cache
  
     def __len__(self) -> int:
         return len(self.chunk_dirs)
  
+    # def __getitem__(self, idx: int) -> Dict:
+    #     chunk_dir = self.chunk_dirs[idx]
+    #     example = load_aligned_example(chunk_dir, self.feat_cfg, self.max_tracks, self.categories)
+    #     feats, labels = example["features"], example["labels"]
+ 
+    #     logmel = feats["logmel"]
+    #     if self.normalizer is not None:
+    #         logmel = self.normalizer.transform_logmel(logmel)
+
+    #     item = {
+    #         "logmel": torch.from_numpy(logmel).float(),      # (n_mics, n_frames, n_mels)
+    #         "chunk_dir": chunk_dir,
+    #     }
+    #     # "gcc_phat" (legacy, pair_mode="all") or "gcc_phat_intra"/"gcc_phat_inter"
+    #     # (pair_mode="grouped"): whichever feature_extraction produced.
+    #     for key in ("gcc_phat", "gcc_phat_intra", "gcc_phat_inter"):
+    #         if key in feats:
+    #             arr = feats[key]                              # (n_pairs_*, n_frames, n_lags_*)
+    #             if self.normalizer is not None:
+    #                 arr = self.normalizer.transform_gcc(arr, key)
+    #             item[key] = torch.from_numpy(arr).float()
+    #     for category, lab in labels.items():
+    #         item[f"{category}_position"] = torch.from_numpy(lab["position_xyz_m"]).float()
+    #         item[f"{category}_tdoa"] = torch.from_numpy(lab["tdoa_s"]).float()
+    #         item[f"{category}_class_id"] = torch.from_numpy(lab["class_id"]).long()
+    #         item[f"{category}_activity"] = torch.from_numpy(lab["activity"]).bool()
+    #     return item
     def __getitem__(self, idx: int) -> Dict:
         chunk_dir = self.chunk_dirs[idx]
-        example = load_aligned_example(chunk_dir, self.feat_cfg, self.max_tracks, self.categories)
-        feats, labels = example["features"], example["labels"]
- 
-        logmel = feats["logmel"]
+        path = cache_path(chunk_dir, self.feat_cfg, self.max_tracks)
+        if self.use_cache and os.path.exists(path):
+            data = load_cached(path)
+        else:
+            data = example_to_arrays(
+                load_aligned_example(chunk_dir, self.feat_cfg, self.max_tracks))
+
+        logmel = data["logmel"]
         if self.normalizer is not None:
             logmel = self.normalizer.transform_logmel(logmel)
+        item = {"logmel": torch.from_numpy(logmel).float(), "chunk_dir": chunk_dir}
 
-        item = {
-            "logmel": torch.from_numpy(logmel).float(),      # (n_mics, n_frames, n_mels)
-            "chunk_dir": chunk_dir,
-        }
-        # "gcc_phat" (legacy, pair_mode="all") or "gcc_phat_intra"/"gcc_phat_inter"
-        # (pair_mode="grouped"): whichever feature_extraction produced.
-        for key in ("gcc_phat", "gcc_phat_intra", "gcc_phat_inter"):
-            if key in feats:
-                arr = feats[key]                              # (n_pairs_*, n_frames, n_lags_*)
+        for key in GCC_KEYS:
+            if key in data:
+                arr = data[key]
                 if self.normalizer is not None:
                     arr = self.normalizer.transform_gcc(arr, key)
                 item[key] = torch.from_numpy(arr).float()
-        for category, lab in labels.items():
-            item[f"{category}_position"] = torch.from_numpy(lab["position_xyz_m"]).float()
-            item[f"{category}_tdoa"] = torch.from_numpy(lab["tdoa_s"]).float()
-            item[f"{category}_class_id"] = torch.from_numpy(lab["class_id"]).long()
-            item[f"{category}_activity"] = torch.from_numpy(lab["activity"]).bool()
+
+        for cat in (self.categories or CATEGORIES):
+            item[f"{cat}_position"] = torch.from_numpy(data[f"{cat}_position"]).float()
+            item[f"{cat}_tdoa"] = torch.from_numpy(data[f"{cat}_tdoa"]).float()
+            item[f"{cat}_class_id"] = torch.from_numpy(data[f"{cat}_class_id"]).long()
+            item[f"{cat}_activity"] = torch.from_numpy(data[f"{cat}_activity"]).bool()
         return item
  
  

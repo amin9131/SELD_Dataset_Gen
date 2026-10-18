@@ -71,12 +71,13 @@ class StaticTrajectory(Trajectory):
  
 class HoverJitterTrajectory(Trajectory):
     """
-    Near-stationary loiter with small mean-reverting random drift
-    (Ornstein-Uhlenbeck process on velocity, integrated to position),
-    which looks like realistic GPS-hold wander rather than a frozen point
-    or an unrealistic pure random walk.
+    Near-stationary loiter: critically-ish damped stochastic oscillator
+        dv = (-2*zeta*omega*v - omega^2*p) dt + sigma dW,   dp = v dt
+    Stationary per-axis statistics (exact for the continuous system):
+        std(p) = jitter_std_m,   std(v) = jitter_std_m * omega
+    with omega = 1/time_constant_s and sigma = j*sqrt(4*zeta*omega^3).
     """
- 
+
     def __init__(
         self,
         center: Sequence[float],
@@ -85,25 +86,31 @@ class HoverJitterTrajectory(Trajectory):
         time_constant_s: float = 1.5,
         fs_internal: float = 20.0,
         rng: np.random.Generator = None,
+        damping_ratio: float = 0.7,
     ):
         self.center = np.array(center, dtype=np.float64)
         self.duration_s = duration_s
         rng = rng or np.random.default_rng()
- 
+
         n = max(2, int(np.ceil(duration_s * fs_internal)) + 1)
         dt = 1.0 / fs_internal
-        theta = 1.0 / time_constant_s
-        sigma = jitter_std_m * np.sqrt(2 * theta)
- 
+        omega = 1.0 / time_constant_s
+        zeta = damping_ratio
+        sigma = jitter_std_m * np.sqrt(4.0 * zeta * omega ** 3)
+
+        # start from the stationary distribution (p and v are uncorrelated there),
+        # otherwise the first few time constants are artificially calm
+        p = rng.standard_normal(3) * jitter_std_m
+        v = rng.standard_normal(3) * jitter_std_m * omega
+
         pos = np.zeros((n, 3))
-        vel = np.zeros(3)
-        p = np.zeros(3)
+        pos[0] = p
         for i in range(1, n):
-            noise = rng.standard_normal(3) * sigma * np.sqrt(dt)
-            vel = vel - theta * p * dt + noise
-            p = p + vel * dt
+            noise = sigma * np.sqrt(dt) * rng.standard_normal(3)
+            v = v + (-2.0 * zeta * omega * v - omega ** 2 * p) * dt + noise
+            p = p + v * dt
             pos[i] = p
- 
+
         self._times = np.arange(n) * dt
         self._positions = self.center + pos
  
